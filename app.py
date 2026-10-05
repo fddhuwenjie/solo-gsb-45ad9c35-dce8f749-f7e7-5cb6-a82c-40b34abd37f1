@@ -7,8 +7,11 @@
 - 承重构件 components：登记时带最低试载值 min_load；origin 为 original（初始在位）
   或 replacement（替换件，登记时不在位，安装工序后在位）。
 - 榫卯连接 connections：事先登记的"允许端点组合"，in_place 表示是否在位；
-  改接（安装连接）只允许使用已登记的端点组合。
+  改接（安装连接）只允许使用已登记的端点组合。端点组合即便在连接自身在位时，
+  也只有在两端构件实际在位（支承点恒在位）后才作为真实榫卯参与路径判断；
+  登记记录保留在登记簿中，可供日后安装使用。
 - 临时支撑 temp_supports：登记后可在位/卸除；不计入"永久连接状态版本"。
+  与永久连接相同：只有自身在位且两端构件实际在位时才进入连接图。
 - 工序回执 steps：按递增工序号提交 install / disassemble / test_load / remove_support。
 
 校验规则
@@ -16,6 +19,8 @@
 - 工序号必须连续递增（last+1），跳号整步拒绝。
 - 每个改变连接图的工序提交后重建连接图：施工中每个在位承重构件必须能经
   在位连接或临时支撑抵达某个固定支承点，否则整步回滚并指出首个受影响构件。
+  连接/支撑只有自身在位且两端构件均实际在位时才参与图（含库内既有记录），
+  未安装构件上的在位榫卯不构成路径。
 - 卸撑（remove_support）：卸除后每个在位承重构件必须仅凭永久连接抵达支承点，
   且每个在位承重构件都有在当前连接状态版本下通过、载荷不低于其最低值的试载。
 - 连接状态版本 version：永久连接图每次变化（装/拆连接、拆构件、装构件）递增；
@@ -155,16 +160,26 @@ def _bump(conn):
 
 
 def _graph(conn):
-    """重建当前连接图：在位构件、支承点、在位永久连接、在位临时支撑。"""
+    """重建当前连接图：在位构件、支承点、有效永久连接、有效临时支撑。
+
+    一条连接/支撑记录仅在自身在位且两端节点均实际在位时才产生图的边：
+    支承点恒在位，构件须 in_place。登记而未安装构件上的"在位"榫卯只是预留
+    端点组合，不参与施工及永久连通性判断（对库内既有记录同样生效）。
+    """
     comps = conn.execute(
         "SELECT id, name, min_load, origin, in_place FROM components ORDER BY rowid"
     ).fetchall()
     sups = [r["id"] for r in conn.execute("SELECT id FROM supports ORDER BY rowid")]
-    perm = [(r["a"], r["b"]) for r in
-            conn.execute("SELECT a, b FROM connections WHERE in_place=1")]
-    temp = [(r["a"], r["b"]) for r in
-            conn.execute("SELECT a, b FROM temp_supports WHERE in_place=1")]
-    return comps, sups, perm, temp
+    live = set(sups) | {c["id"] for c in comps if c["in_place"]}
+
+    def _effective(table):
+        out = []
+        for r in conn.execute(f"SELECT a, b FROM {table} WHERE in_place=1"):
+            if r["a"] in live and r["b"] in live:
+                out.append((r["a"], r["b"]))
+        return out
+
+    return comps, sups, _effective("connections"), _effective("temp_supports")
 
 
 def _reachable(supports, edges):
@@ -570,8 +585,14 @@ def create_snapshot(_body):
                 "origin": c["origin"],
                 "accepted_test": dict(t) if t else None,
             })
-        joints = [dict(r) for r in conn.execute(
-            "SELECT id, a, b FROM connections WHERE in_place=1 ORDER BY rowid")]
+        # 快照中的在位连接清单与路径判断一致：仅含自身在位且两端构件实际在位者
+        live = set(sups) | {c["id"] for c in comps if c["in_place"]}
+        joints = [
+            {"id": r["id"], "a": r["a"], "b": r["b"]}
+            for r in conn.execute(
+                "SELECT id, a, b FROM connections WHERE in_place=1 ORDER BY rowid")
+            if r["a"] in live and r["b"] in live
+        ]
         receipts = [{
             "seq": r["seq"], "action": r["action"],
             "payload": json.loads(r["payload"]), "result": json.loads(r["result"]),

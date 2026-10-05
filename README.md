@@ -21,8 +21,13 @@ docker compose up --build
 - **工序递增**：`POST /steps` 的 `seq` 必须等于上一条已接受回执 +1，跳号整步拒绝。
 - **施工中可达性**：每个改变连接图的工序提交后重建连接图——每个在位承重构件必须能经
   **在位连接或临时支撑**抵达某个固定支承点，否则整步回滚。
+- **连接仅在端点实际在位时传力**：`/connections` 登记的是"允许的端点组合"，登记记录一直保留；
+  但一条连接（及临时支撑）只有**自身在位且两端构件均实际在位**（支承点恒在位）时才进入连接图，
+  参与施工及永久连通性判断。未安装替换件上的在位榫卯**不构成路径**；此规则在建图时生效，
+  对升级前已写入数据库的同类记录同样适用（无需迁移数据）。构件日后安装后，这些连接自动传力。
 - **卸撑**：卸除临时支撑后，每个在位承重构件必须**仅凭永久连接**抵达支承点，且每个构件
   都有在**当前连接状态版本**下通过、载荷不低于其 `min_load` 的试载记录。
+  否则返回 409 `support_unreachable`（首个失去永久支承的构件见 `first_affected_component`）。
 - **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件）版本 +1；试载记录当时版本，
   图一变旧试载即失效。临时支撑的搭设/卸除不影响版本。
 - **改接限制**：安装连接只允许使用事先登记的端点组合（`POST /connections` 登记的 id）。
@@ -121,6 +126,55 @@ curl $B/steps/4      # 单条工序
 curl $B/state        # 当前连接图与各构件状态
 curl $B/snapshots/1  # 验收快照
 ```
+
+## 故障与修复示例：未安装替换件不得当作传力路径
+
+场景：固定支承点 `S`、在位承重梁 `C`、未安装替换件 `R`；事先登记的 `S—R`、`R—C`
+两条榫卯因端点组合默认在位，但 `R` 实际不在位。搭设 `S—C` 临时支撑并完成 `C` 的
+合格试载后，旧缺陷会错误允许卸撑与固化快照——卸撑后 `C` 的唯一"永久路径"穿过未安装的 `R`。
+
+以下脚本可直接执行（建议指向空库；`HTTP %{http_code}` 展示状态码）：
+
+```bash
+B=http://localhost:8080
+
+# 1) 登记：S、在位梁 C、未安装替换件 R；S-R / R-C 默认在位（端点组合），T 默认未搭设
+curl -s -X POST $B/supports      -d '{"id":"S","name":"柱础"}'
+curl -s -X POST $B/components    -d '{"id":"C","name":"承重梁","min_load":10}'
+curl -s -X POST $B/replacements  -d '{"id":"R","name":"替换梁","min_load":10}'
+curl -s -X POST $B/connections   -d '{"id":"JSR","a":"S","b":"R"}'
+curl -s -X POST $B/connections   -d '{"id":"JRC","a":"R","b":"C"}'
+curl -s -X POST $B/temp-supports -d '{"id":"T","a":"S","b":"C"}'
+
+# 2) 搭设临时支撑 seq1，对 C 合格试载 seq2
+curl -s -X POST $B/steps -d '{"seq":1,"action":"install","target":"temp_support","id":"T"}'
+curl -s -X POST $B/steps -d '{"seq":2,"action":"test_load","component":"C","load":12}'
+
+# 3) /state：C 借临时支撑施工可达(reachable=true)，但永久不可达(permanent_reachable=false)
+curl -s $B/state
+
+# 4) 卸撑 seq3 → 409 support_unreachable，first_affected_component=C
+#    整步拒绝：工序号、回执与 T 的在位状态均不变（故仍以 seq3 重试）
+curl -s -w ' HTTP %{http_code}\n' -X POST $B/steps \
+  -d '{"seq":3,"action":"remove_support","id":"T"}'
+
+# 5) 临时支撑仍在位时，快照同样被拒绝：409 shoring_incomplete
+#    （即便临时支撑已不在位，穿过未安装 R 的虚假路径也会被 409 support_unreachable 拒绝）
+curl -s -w ' HTTP %{http_code}\n' -X POST $B/snapshots -d '{}'
+
+# 6) 按原工序安装替换件 R（JSR/JRC 随 R 实际在位而自动参与传力，无需改接）
+curl -s -X POST $B/steps -d '{"seq":3,"action":"install","target":"replacement","id":"R"}'
+#    安装构件使永久连接状态版本 +1，旧试载失效；在新版本重新合格试载
+curl -s -X POST $B/steps -d '{"seq":4,"action":"test_load","component":"R","load":11}'
+curl -s -X POST $B/steps -d '{"seq":5,"action":"test_load","component":"C","load":12}'
+
+# 7) 合格试载支持卸撑 seq6，随后固化验收快照
+curl -s -X POST $B/steps -d '{"seq":6,"action":"remove_support","id":"T"}'
+curl -s -w ' HTTP %{http_code}\n' -X POST $B/snapshots -d '{}'
+```
+
+说明：已固化的快照只增不改，升级前存在库中的快照即使含旧清单也保持原样；新规则只影响
+此后的 `/state`、工序校验与新快照。升级前已写入库的同类连接记录无需迁移，建图时统一过滤。
 
 ## 错误响应
 
