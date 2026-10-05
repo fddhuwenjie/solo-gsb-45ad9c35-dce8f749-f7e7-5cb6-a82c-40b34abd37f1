@@ -19,8 +19,12 @@ docker compose up --build
 ## 验收规则
 
 - **工序递增**：`POST /steps` 的 `seq` 必须等于上一条已接受回执 +1，跳号整步拒绝。
-- **施工中可达性**：每个改变连接图的工序提交后重建连接图——每个在位承重构件必须能经
-  **在位连接或临时支撑**抵达某个固定支承点，否则整步回滚。
+- **连接在位判定**：榫卯连接/临时支撑只有**自身在位且两端构件均实际在位**
+  （固定支承点恒在位）才参与施工与永久连通性判断。为尚未安装的替换件预登记的
+  默认在位榫卯只是"允许端点组合"，在替换件实际安装前沿路不生效；该规则在重建
+  连接图时实时计算，数据库中已登记的同类记录同样遵循，无需迁移。
+- **施工中可达性**：每个改变连接图的工序提交后、以及试载时重建连接图——每个在位
+  承重构件必须能经**在位连接或临时支撑**抵达某个固定支承点，否则整步回滚。
 - **卸撑**：卸除临时支撑后，每个在位承重构件必须**仅凭永久连接**抵达支承点，且每个构件
   都有在**当前连接状态版本**下通过、载荷不低于其 `min_load` 的试载记录。
 - **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件）版本 +1；试载记录当时版本，
@@ -122,6 +126,70 @@ curl $B/state        # 当前连接图与各构件状态
 curl $B/snapshots/1  # 验收快照
 ```
 
+## 故障与修复示例：未安装替换件不得充当传力路径
+
+登记固定支承点 `S`、在位承重梁 `C`、**未安装**替换件 `R`，以及 `S—R`、`R—C`
+两条默认在位榫卯（只是预留端点组合）。再搭设 `S—C` 临时支撑并完成 `C` 的
+合格试载：此时 `C` 唯一的"永久路径"穿过未安装的 `R`，卸撑和快照都必须拒绝；
+待 `R` 按原工序安装接入、重新试载合格后，才允许卸撑与验收。
+
+一键执行（含 409 断言，请在空库上跑，例如 `docker compose up --build` 后的全新卷）：
+
+```bash
+./demo_uninstalled_replacement.sh
+```
+
+逐条手动执行：
+
+```bash
+B=http://localhost:8080
+
+# 1) 登记：S、C 在位；R 未安装；S—R、R—C 为默认在位榫卯
+curl -X POST $B/supports     -d '{"id":"S","name":"柱础"}'
+curl -X POST $B/components   -d '{"id":"C","name":"承重梁","min_load":10}'
+curl -X POST $B/replacements -d '{"id":"R","name":"替换件","min_load":10}'
+curl -X POST $B/connections  -d '{"id":"JSR","a":"S","b":"R"}'
+curl -X POST $B/connections  -d '{"id":"JRC","a":"R","b":"C"}'
+
+# 2) /state：两条榫卯搭在未安装的 R 上而沿路失效
+#    C 的 reachable=false、permanent_reachable=false（R 行 in_place=false，可达性为 null）
+curl $B/state
+
+# 3) 搭设 S—C 临时支撑并完成 C 的合格试载
+curl -X POST $B/temp-supports -d '{"id":"T","a":"S","b":"C"}'
+curl -X POST $B/steps -d '{"seq":1,"action":"install","target":"temp_support","id":"T"}'
+curl -X POST $B/steps -d '{"seq":2,"action":"test_load","component":"C","load":12}'
+
+# 4) 故障：卸撑后 C 的唯一永久路径穿过未安装的 R → 409，首个受影响构件 C
+curl -X POST $B/steps -d '{"seq":3,"action":"remove_support","id":"T"}'
+#   → 409 support_unreachable
+#     {"error":"support_unreachable",
+#      "message":"卸撑后构件 C 无法仅凭永久连接抵达固定支承点，整步拒绝",
+#      "first_affected_component":"C"}
+#   整步回滚：无 seq 3 回执，last_seq 仍为 2，临时支撑 T 仍在位
+
+# 5) 支撑尚在位时不能固化快照
+curl -X POST $B/snapshots -d '{}'
+#   → 409 shoring_incomplete，temp_support=T
+
+#    对照：若任何临时支撑都不存在（如未搭设或另一个空库），同样不得固化虚假路径
+#   → 409 support_unreachable，first_affected_component=C
+
+# 6) 修复：按原工序安装 R；默认在位的 JSR/JRC 随 R 在位自动接入，永久路径打通
+curl -X POST $B/steps -d '{"seq":3,"action":"install","target":"replacement","id":"R"}'
+
+# 7) 连接状态版本因安装变为 v1，旧试载失效；对 C、R 重新合格试载
+curl -X POST $B/steps -d '{"seq":4,"action":"test_load","component":"C","load":11}'
+curl -X POST $B/steps -d '{"seq":5,"action":"test_load","component":"R","load":10}'
+
+# 8) 合格试载支持卸撑与验收
+curl -X POST $B/steps      -d '{"seq":6,"action":"remove_support","id":"T"}'   # 201
+curl -X POST $B/snapshots  -d '{}'                                             # 201 快照 1
+curl $B/snapshots/1
+#   快照中 C、R 均带 v1 合格试载，connections_in_place 含 JSR、JRC
+#   此后继续修复只增不改，快照 1 保持原样
+```
+
 ## 错误响应
 
 统一 JSON：`{"error": <code>, "message": ..., ...}`。工序拒绝一律 409 且状态不变：
@@ -132,7 +200,7 @@ curl $B/snapshots/1  # 验收快照
 | `not_registered` | 连接/支撑/构件未事先登记 |
 | `endpoint_not_in_place` | 端点不在位（附 `first_affected_component`） |
 | `not_in_place` / `already_in_place` | 拆卸/安装对象状态不符 |
-| `unreachable` | 工序后构件无法抵达固定支承点 |
+| `unreachable` | 工序后（含试载时）构件无法经在位连接或临时支撑抵达固定支承点 |
 | `support_unreachable` | 卸撑后构件无法仅凭永久连接抵达支承点 |
 | `test_load_missing` | 构件缺少当前连接状态下通过的合格试载 |
 | `shoring_incomplete` | 临时支撑未卸完，不能固化快照 |
@@ -144,5 +212,6 @@ app.py              # 服务全部实现（标准库 HTTP + SQLite）
 Dockerfile          # python:3.12-slim 单容器镜像
 docker-compose.yml  # 单条命令启动，卷持久化
 demo.sh             # 端到端演示脚本
+demo_uninstalled_replacement.sh  # 未安装替换件虚假路径：故障复现与修复演示
 README.md
 ```

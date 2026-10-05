@@ -7,15 +7,21 @@
 - 承重构件 components：登记时带最低试载值 min_load；origin 为 original（初始在位）
   或 replacement（替换件，登记时不在位，安装工序后在位）。
 - 榫卯连接 connections：事先登记的"允许端点组合"，in_place 表示是否在位；
-  改接（安装连接）只允许使用已登记的端点组合。
-- 临时支撑 temp_supports：登记后可在位/卸除；不计入"永久连接状态版本"。
+  改接（安装连接）只允许使用已登记的端点组合。连接只有自身在位且两端构件
+  均实际在位时才参与路径判断（支承点恒在位）；为未安装替换件预留的默认在位
+  榫卯在替换件实际安装前沿路不生效。该判定在每次重建连接图时实时进行，
+  数据库中已登记的同类记录同样遵循。
+- 临时支撑 temp_supports：登记后可在位/卸除；不计入"永久连接状态版本"；
+  同样要求两端节点实际在位才参与施工期路径判断。
 - 工序回执 steps：按递增工序号提交 install / disassemble / test_load / remove_support。
 
 校验规则
 --------
 - 工序号必须连续递增（last+1），跳号整步拒绝。
 - 每个改变连接图的工序提交后重建连接图：施工中每个在位承重构件必须能经
-  在位连接或临时支撑抵达某个固定支承点，否则整步回滚并指出首个受影响构件。
+  在位连接或临时支撑抵达某个固定支承点，否则整步回滚并指出首个受影响构件；
+  试载同样校验被试构件具备该施工期路径。参与判断的连接必须自身在位且两端
+  构件实际在位（见上）。
 - 卸撑（remove_support）：卸除后每个在位承重构件必须仅凭永久连接抵达支承点，
   且每个在位承重构件都有在当前连接状态版本下通过、载荷不低于其最低值的试载。
 - 连接状态版本 version：永久连接图每次变化（装/拆连接、拆构件、装构件）递增；
@@ -154,16 +160,33 @@ def _bump(conn):
     return v
 
 
+def _live_nodes(conn, comps, sups):
+    """当前实际在位的节点集合：固定支承点恒在位，外加在位构件。"""
+    live = set(sups)
+    for c in comps:
+        if c["in_place"]:
+            live.add(c["id"])
+    return live
+
+
 def _graph(conn):
-    """重建当前连接图：在位构件、支承点、在位永久连接、在位临时支撑。"""
+    """重建当前连接图：在位构件、支承点、在位永久连接、在位临时支撑。
+
+    连接/支撑只有自身在位且两端节点均实际在位（支承点恒在位）才作为
+    有效边返回；未安装替换件身上的"默认在位"榫卯不参与任何路径判断。
+    """
     comps = conn.execute(
         "SELECT id, name, min_load, origin, in_place FROM components ORDER BY rowid"
     ).fetchall()
     sups = [r["id"] for r in conn.execute("SELECT id FROM supports ORDER BY rowid")]
-    perm = [(r["a"], r["b"]) for r in
-            conn.execute("SELECT a, b FROM connections WHERE in_place=1")]
-    temp = [(r["a"], r["b"]) for r in
-            conn.execute("SELECT a, b FROM temp_supports WHERE in_place=1")]
+    live = _live_nodes(conn, comps, sups)
+
+    def _live_edges(rows):
+        return [(r["a"], r["b"]) for r in rows
+                if r["a"] in live and r["b"] in live]
+
+    perm = _live_edges(conn.execute("SELECT a, b FROM connections WHERE in_place=1"))
+    temp = _live_edges(conn.execute("SELECT a, b FROM temp_supports WHERE in_place=1"))
     return comps, sups, perm, temp
 
 
@@ -497,8 +520,9 @@ def create_step(body):
             result = _apply_test_load(conn, seq, body)
         else:
             result = _apply_remove_support(conn, body)
-        # 每步重建连接图做施工中校验（卸撑已在 _apply_remove_support 内做更严校验）
-        if action in ("install", "disassemble"):
+        # 每步重建连接图做施工中校验：装/拆改变连接图，试载也必须作用于
+        # 当前经在位连接或临时支承可达的构件（卸撑在自身函数内做更严校验）
+        if action in ("install", "disassemble", "test_load"):
             _check_construction_reachability(conn)
         receipt = {
             "seq": seq,
@@ -570,8 +594,10 @@ def create_snapshot(_body):
                 "origin": c["origin"],
                 "accepted_test": dict(t) if t else None,
             })
+        live = _live_nodes(conn, comps, sups)
         joints = [dict(r) for r in conn.execute(
-            "SELECT id, a, b FROM connections WHERE in_place=1 ORDER BY rowid")]
+            "SELECT id, a, b FROM connections WHERE in_place=1 ORDER BY rowid")
+            if r["a"] in live and r["b"] in live]
         receipts = [{
             "seq": r["seq"], "action": r["action"],
             "payload": json.loads(r["payload"]), "result": json.loads(r["result"]),
